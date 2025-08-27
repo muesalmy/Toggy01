@@ -86,7 +86,6 @@ InitTestScene*.unity*
 /[Aa]ssets/Addressables_Temp*
 # By default, Addressables content builds will generate addressables_content_state.bin
 # files in platform-specific subfolders, for example:
-# /Assets/AddressableAssetsData/OSX/addressables_content_state.bin
 /[Aa]ssets/AddressableAssetsData/*/*.bin*
 
 # Visual Scripting auto-generated files
@@ -97,3 +96,8 @@ InitTestScene*.unity*
 
 # Auto-generated scenes by play mode tests
 /[Aa]ssets/[Ii]nit[Tt]est[Ss]cene*.unity*
+
+# --- Project-specific additions (large AI model excludes) ---
+# Exclude large Whisper model binaries from version control
+/[Aa]ssets/StreamingAssets/Models/*.bin
+/[Aa]ssets/StreamingAssets/Models/*.ggml
