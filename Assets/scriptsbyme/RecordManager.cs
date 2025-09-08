@@ -1,209 +1,317 @@
 using UnityEngine;
 using System;
+using System.Collections;
 using System.Collections.Generic;
 
 [RequireComponent(typeof(AudioSource))]
 public class RecordManager : MonoBehaviour
 {
     [Header("Mic Settings")]
-    public string microphoneDevice = null; // null => varsayılan cihaz [1]
-    public int targetSampleRate = 16000;   // Whisper hedefi 16 kHz [2]
-    public int recordLengthSec = 10;       // Döngüsel mic buffer uzunluğu (saniye) [1]
+    public string microphoneDevice = null; // null => varsayılan cihaz
+    public int targetRate = 16000;         // hedef örnekleme hızı (Hz)
+    public int recordLength = 10;          // kayıt tamponu uzunluğu (saniye)
     public bool debugLogs = true;
 
     private AudioSource _audioSource;
     private AudioClip _micClip;
-    private int _micChannels = 1;          // Çoğu cihazda 1; değilse mono’ya indirgeriz [1]
-    private int _micSampleRate;            // Gerçek mic örnekleme hızı (44.1k/48k vs) [3]
-    private int _lastReadPos = 0;          // Döngüsel klip için okuma imleci [4]
+    private int _micChannels = 1;
+    private int _micSampleRate;
+    private int _lastReadPos;
 
-    // Ring buffer (mic SR, mono)
     private float[] _monoRing;
-    private int _monoWrite;                // yazma imleci
-    private int _monoRead;                 // okuma imleci
+    private int _monoWrite;
+    private int _monoRead;
 
-    // Çıkış: 16k mono dilimler
-    public Action<float[]> OnChunkReady16k; // Dışa: Whisper’a beslemek için [2]
+    public Action<float[]> OnChunkReady16k;
 
-    // 0.5 sn @ 16k => 8000 örnek hedef çıkış [2]
-    private int TargetChunkSamples16k => targetSampleRate / 2;
+    private int TargetSamplesPerChunk => targetRate / 2; // 0.5s chunk = 8000 örnek
+    private static Stack<float[]> _pool = new Stack<float[]>();
+
+    private bool permissionGranted = false;
+
+    // Log spamini azaltmak için
+    private int _lastLoggedMicPos = -1;
+    private float _lastNoSampleLogTime = 0f;
 
     void Awake()
     {
         _audioSource = GetComponent<AudioSource>();
-        _audioSource.loop = true;
+        _audioSource.volume = 0f;
+        _audioSource.mute = true;
+        _audioSource.loop = false;
         _audioSource.playOnAwake = false;
-        _audioSource.mute = true; // geri beslemeyi önler [1]
+        _audioSource.spatialBlend = 0f;
+        if (debugLogs) Debug.Log("[RecordManager] Awake: AudioSource hazır.");
+    }
+
+    void Start()
+    {
+        StartCoroutine(CheckAndRequestMicPermission());
+    }
+
+    IEnumerator CheckAndRequestMicPermission()
+    {
+        if (!Application.HasUserAuthorization(UserAuthorization.Microphone))
+        {
+            if (debugLogs) Debug.Log("[RecordManager] Mikrofon izni kontrol ediliyor...");
+            yield return Application.RequestUserAuthorization(UserAuthorization.Microphone);
+        }
+
+        if (Application.HasUserAuthorization(UserAuthorization.Microphone))
+        {
+            permissionGranted = true;
+            if (debugLogs) Debug.Log("[RecordManager] Mikrofon izni verildi.");
+            StartRecording();
+        }
+        else
+        {
+            permissionGranted = false;
+            if (debugLogs) Debug.LogWarning("[RecordManager] Mikrofon izni reddedildi.");
+        }
     }
 
     public void StartRecording()
     {
-        if (Microphone.devices == null || Microphone.devices.Length == 0)
+        if (!permissionGranted)
         {
-            if (debugLogs) Debug.LogWarning("No microphone devices found."); // [1]
+            if (debugLogs) Debug.LogWarning("[RecordManager] Mikrofon izni yok.");
             return;
         }
 
-        // Gerçek SR tespiti (bazı cihazlar verilen SR'yi uygulamaz) [3]
-        int minFreq, maxFreq;
-        Microphone.GetDeviceCaps(microphoneDevice, out minFreq, out maxFreq); // bilgi amaçlı [1]
-        _micSampleRate = AudioSettings.outputSampleRate; // pratik yaklaşım [3]
-        if (_micSampleRate <= 0) _micSampleRate = 48000;
+        if (Microphone.devices == null || Microphone.devices.Length == 0)
+        {
+            if (debugLogs) Debug.LogWarning("[RecordManager] Mikrofon bulunamadı.");
+            return;
+        }
 
-        // Mic’i başlat (looping clip) [1]
-        _micClip = Microphone.Start(microphoneDevice, true, recordLengthSec, _micSampleRate);
-        // İlk örnekler gelene kadar bekle (kısa spin) [1]
+        // Cihazları logla ve gerekirse ilkini seç
+        if (debugLogs)
+        {
+            Debug.Log("[RecordManager] Bulunan mikrofon cihazları:");
+            for (int i = 0; i < Microphone.devices.Length; i++)
+                Debug.Log($"  - {i}: {Microphone.devices[i]}");
+        }
+        if (string.IsNullOrEmpty(microphoneDevice))
+        {
+            microphoneDevice = Microphone.devices[0];
+            if (debugLogs) Debug.Log($"[RecordManager] Varsayılan mikrofon seçildi: {microphoneDevice}");
+        }
+
+        if (_micClip != null)
+        {
+            if (debugLogs) Debug.Log("[RecordManager] Mevcut kayıt durduruluyor.");
+            StopRecording();
+        }
+
+        // Cihaz kapasiteleri ve güvenli örnekleme hızı
+        Microphone.GetDeviceCaps(microphoneDevice, out int minFreq, out int maxFreq);
+        // min/max bazı cihazlarda 0,0 dönebilir => 44100 kullan
+        if (minFreq == 0 && maxFreq == 0)
+        {
+            _micSampleRate = 44100;
+        }
+        else
+        {
+            // Hedef: output sample rate veya aralıktaki güvenli bir değer
+            int desired = AudioSettings.outputSampleRate > 0 ? AudioSettings.outputSampleRate : 44100;
+            _micSampleRate = Mathf.Clamp(desired, minFreq == 0 ? desired : minFreq, maxFreq == 0 ? desired : maxFreq);
+        }
+
+        if (debugLogs) Debug.Log($"[RecordManager] Mikrofon başlatılıyor: {microphoneDevice}, {_micSampleRate}Hz");
+
+        _micClip = Microphone.Start(microphoneDevice, true, recordLength, _micSampleRate);
+
+        // Başlatma beklemesi: pozisyon ilerliyor mu kontrol et
         int safety = 0;
-        while (Microphone.GetPosition(microphoneDevice) <= 0 && safety++ < 200) { }
+        int lastPos = -1;
+        while (safety < 500)
+        {
+            int pos = Microphone.GetPosition(microphoneDevice);
+            if (pos > 0 && pos != lastPos)
+                break;
+            lastPos = pos;
+            System.Threading.Thread.Sleep(2);
+            safety++;
+        }
 
-        _audioSource.clip = _micClip;
-        _audioSource.loop = true;
-        _audioSource.mute = true;
-        _audioSource.Play(); // sessiz çal [1]
+        // AudioSource ata (oynatmak şart değil; GetData ile okuyacağız)
+        if (_micClip != null)
+        {
+            _audioSource.clip = _micClip;
+            _audioSource.loop = false;
+            _audioSource.mute = true;
+            _audioSource.volume = 0f;
+            // Oynatmak isterseniz açabilirsiniz; FMOD sorunlarında genelde gerekmez:
+            // _audioSource.Play();
+        }
 
-        _micChannels = Mathf.Max(1, _micClip.channels); // interleaved kanallar olabilir [2]
+        _micChannels = Mathf.Max(1, _micClip.channels);
         _lastReadPos = 0;
 
-        // Ring buffer boyutu: mic SR * birkaç saniye (burada recordLengthSec kadar) [4]
-        int ringLen = Mathf.NextPowerOfTwo(_micSampleRate * Mathf.Max(1, recordLengthSec));
+        int ringLen = Mathf.NextPowerOfTwo(_micSampleRate * Mathf.Max(1, recordLength));
         _monoRing = new float[ringLen];
         _monoWrite = 0;
         _monoRead = 0;
 
-        if (debugLogs) Debug.Log($"Mic started: dev='{microphoneDevice ?? "default"}', rate={_micSampleRate}Hz, len={recordLengthSec}s, ch={_micChannels}");
+        if (debugLogs) Debug.Log($"[RecordManager] Kayıt başladı. Kanal: {_micChannels}, Buffer: {ringLen}");
     }
 
     public void StopRecording()
     {
-        if (_micClip != null && Microphone.IsRecording(microphoneDevice))
-            Microphone.End(microphoneDevice); // [1]
+        if (debugLogs) Debug.Log("[RecordManager] Kayıt durduruluyor...");
 
-        if (_audioSource.isPlaying)
+        if (_audioSource != null && _audioSource.isPlaying)
+        {
             _audioSource.Stop();
+            _audioSource.clip = null;
+            if (debugLogs) Debug.Log("[RecordManager] AudioSource durduruldu.");
+        }
+
+        if (_micClip != null && Microphone.IsRecording(microphoneDevice))
+        {
+            Microphone.End(microphoneDevice);
+            if (debugLogs) Debug.Log("[RecordManager] Mikrofon kapatıldı.");
+        }
 
         _micClip = null;
         _monoRing = null;
 
-        if (debugLogs) Debug.Log("Mic stopped.");
+        if (debugLogs) Debug.Log("[RecordManager] Kayıt durduruldu.");
     }
 
     void Update()
     {
         if (_micClip == null) return;
 
-        // Döngüsel mic klibinden yeni yazılmış kısmı çek [4]
         int micPos = Microphone.GetPosition(microphoneDevice);
+
+        // Pozisyon değiştiğinde seyrek log
+        if (debugLogs && micPos != _lastLoggedMicPos)
+        {
+            Debug.Log($"[RecordManager] Update: Mikrofon pozisyonu: {micPos}/{_micClip.samples}");
+            _lastLoggedMicPos = micPos;
+        }
+
         if (micPos < 0 || micPos > _micClip.samples) return;
 
         int totalSamples = _micClip.samples;
-        // Yeni veri uzunluğu (frame cinsinden)
-        int newFrames = micPos - _lastReadPos;
-        if (newFrames < 0)
-            newFrames += totalSamples; // wrap-around [5]
-        if (newFrames == 0) return;
+        int newSamples = micPos - _lastReadPos;
+        if (newSamples < 0) newSamples += totalSamples;
 
-        // Okumayı iki parçaya böl (wrap olabilir)
-        ReadMicSegment(_lastReadPos, Mathf.Min(newFrames, totalSamples - _lastReadPos));
-        int remaining = newFrames - (totalSamples - _lastReadPos);
-        if (remaining > 0)
-            ReadMicSegment(0, remaining);
+        if (newSamples == 0)
+        {
+            // 0.5 saniyede bir kez bilgilendirme
+            if (debugLogs && Time.realtimeSinceStartup - _lastNoSampleLogTime > 0.5f)
+            {
+                Debug.Log("[RecordManager] Update: Yeni örnek yok (newSamples=0)");
+                _lastNoSampleLogTime = Time.realtimeSinceStartup;
+            }
+            return;
+        }
+
+        if (debugLogs) Debug.Log($"[RecordManager] Update: {newSamples} yeni örnek.");
+
+        // Dairesel buffer'a yeni veriyi oku
+        ReadSegment(_lastReadPos, Mathf.Min(newSamples, totalSamples - _lastReadPos));
+        int overflow = newSamples - Mathf.Min(newSamples, totalSamples - _lastReadPos);
+        if (overflow > 0) ReadSegment(0, overflow);
 
         _lastReadPos = micPos;
 
-        // Ring buffer’dan downsample için yeterli input var mı? [2]
-        int needInput = Mathf.CeilToInt(TargetChunkSamples16k * (_micSampleRate / (float)targetSampleRate));
-        while (AvailableMonoSamples() >= needInput)
-        {
-            // Input’u kopyala
-            var tempIn = RentArray(needInput);
-            DequeueMono(tempIn, needInput);
+        // Downsample için gereken input
+        int requiredInput = Mathf.CeilToInt(TargetSamplesPerChunk * (_micSampleRate / (float)targetRate));
 
-            // 16k downsample (lineer enterpolasyon) [2]
-            var down = DownsampleLinear(tempIn, _micSampleRate, targetSampleRate);
-            OnChunkReady16k?.Invoke(down); // dışa ver [2]
+        while (AvailableSamples() >= requiredInput)
+        {
+            var audioData = RentArray(requiredInput);
+            DequeueMono(audioData, requiredInput);
+
+            var downsampled = Downsample(audioData, _micSampleRate, targetRate);
+
+            if (debugLogs) Debug.Log($"[RecordManager] Chunk hazır: {downsampled.Length} örnek.");
+
+            OnChunkReady16k?.Invoke(downsampled);
         }
     }
 
-    // Mic klipten bir segmenti oku, mono’ya indir ve ring buffer’a yaz [2]
-    private void ReadMicSegment(int startSample, int frames)
+    private void ReadSegment(int start, int length)
     {
-        if (frames <= 0) return;
+        if (length <= 0) return;
 
-        int samplesToRead = frames * _micChannels;
-        var temp = RentArray(samplesToRead);
-        _micClip.GetData(temp, startSample); // interleaved PCM [2]
+        int sampleCount = length * _micChannels;
+        var buffer = RentArray(sampleCount);
+        _micClip.GetData(buffer, start);
 
-        // Interleaved -> mono ortalaması [2]
         if (_micChannels == 1)
         {
-            EnqueueMono(temp, frames);
+            EnqueueMono(buffer, length);
         }
         else
         {
-            var monoTemp = RentArray(frames);
-            for (int i = 0, o = 0; i < samplesToRead; i += _micChannels, o++)
+            var monoBuffer = RentArray(length);
+            for (int i = 0, o = 0; i < sampleCount; i += _micChannels, o++)
             {
                 float sum = 0f;
-                for (int ch = 0; ch < _micChannels; ch++) sum += temp[i + ch];
-                monoTemp[o] = sum / _micChannels;
+                for (int ch = 0; ch < _micChannels; ch++) sum += buffer[i + ch];
+                monoBuffer[o] = sum / _micChannels;
             }
-            EnqueueMono(monoTemp, frames);
+            EnqueueMono(monoBuffer, length);
+            ReturnArray(monoBuffer);
         }
+        ReturnArray(buffer);
     }
 
-    // Ring buffer yardımcıları [4]
-    private void EnqueueMono(float[] src, int count)
+    private void EnqueueMono(float[] data, int count)
     {
-        int n = _monoRing.Length;
+        int size = _monoRing.Length;
         for (int i = 0; i < count; i++)
         {
-            _monoRing[_monoWrite] = src[i];
-            _monoWrite = (_monoWrite + 1) & (n - 1);
-            // Overrun halinde read'i ileri al
+            _monoRing[_monoWrite] = data[i];
+            _monoWrite = (_monoWrite + 1) & (size - 1);
             if (_monoWrite == _monoRead)
-                _monoRead = (_monoRead + 1) & (n - 1);
+                _monoRead = (_monoRead + 1) & (size - 1);
         }
     }
 
-    private void DequeueMono(float[] dst, int count)
+    private void DequeueMono(float[] dest, int count)
     {
-        int n = _monoRing.Length;
+        int size = _monoRing.Length;
         for (int i = 0; i < count; i++)
         {
-            if (_monoRead == _monoWrite) { dst[i] = 0f; continue; } // underflow koruması
-            dst[i] = _monoRing[_monoRead];
-            _monoRead = (_monoRead + 1) & (n - 1);
+            if (_monoRead == _monoWrite) dest[i] = 0f;
+            else
+            {
+                dest[i] = _monoRing[_monoRead];
+                _monoRead = (_monoRead + 1) & (size - 1);
+            }
         }
     }
 
-    private int AvailableMonoSamples()
+    private int AvailableSamples()
     {
-        int n = _monoRing.Length;
-        int avail = _monoWrite - _monoRead;
-        if (avail < 0) avail += n;
-        return avail;
+        int diff = _monoWrite - _monoRead;
+        if (diff < 0) diff += _monoRing.Length;
+        return diff;
     }
 
-    // Basit lineer enterpolasyonla downsample [2]
-    public static float[] DownsampleLinear(float[] input, int srcRate, int dstRate)
+    private static float[] Downsample(float[] input, int src, int dst)
     {
-        if (srcRate == dstRate) return (float[])input.Clone();
-        double ratio = (double)dstRate / srcRate;
-        int outLen = (int)Math.Floor(input.Length * ratio);
-        var output = new float[outLen];
-        for (int i = 0; i < outLen; i++)
+        if (src == dst) return (float[])input.Clone();
+
+        double ratio = (double)dst / src;
+        int len = (int)(input.Length * ratio);
+        var output = new float[len];
+        for (int i = 0; i < len; i++)
         {
-            double srcPos = i / ratio;
-            int i0 = (int)Math.Floor(srcPos);
-            int i1 = Math.Min(i0 + 1, input.Length - 1);
-            double t = srcPos - i0;
-            output[i] = (float)((1.0 - t) * input[i0] + t * input[i1]);
+            double pos = i / ratio;
+            int i0 = (int)pos;
+            int i1 = Mathf.Min(i0 + 1, input.Length - 1);
+            double t = pos - i0;
+            output[i] = (float)((1 - t) * input[i0] + t * input[i1]);
         }
         return output;
     }
 
-    // Basit array havuzu: GC tahsisini azaltır
-    private static readonly Stack<float[]> _pool = new Stack<float[]>();
     private static float[] RentArray(int size)
     {
         if (_pool.Count > 0)
@@ -213,6 +321,7 @@ public class RecordManager : MonoBehaviour
         }
         return new float[size];
     }
+
     private static void ReturnArray(float[] arr)
     {
         if (arr != null) _pool.Push(arr);
@@ -220,6 +329,7 @@ public class RecordManager : MonoBehaviour
 
     void OnDisable()
     {
+        if (debugLogs) Debug.Log("[RecordManager] OnDisable: Mikrofon durduruluyor.");
         StopRecording();
     }
 }
